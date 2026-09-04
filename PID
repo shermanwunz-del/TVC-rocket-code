@@ -1,0 +1,437 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <Adafruit_BMP280.h>
+#include <Servo.h>
+#include <SPI.h>
+#include <SD.h>
+
+#define DEBUG_SERIAL 0
+#define USE_STORED_OFFSETS 1
+
+const int16_t STORED_OFFSETS[11] = {-24, -19, -13, 51, 449, -1126, -2, 1, -1, 1000, 526};
+
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x29);
+Adafruit_BMP280 bmp;
+
+Servo servoPitch;
+Servo servoRoll;
+Servo servoAux;
+
+const int SERVO_PITCH_PIN = 6;
+const int SERVO_ROLL_PIN  = 7;
+const int SERVO_AUX_PIN   = 8;
+
+// ---- Status indicator ----
+// Using the board's built-in LED (pin 13). Note: pin 13 is also the SPI
+// clock (SCK) line, shared with the SD card, so expect some flicker on the
+// LED during SD writes in the main loop. Boot-time fault/calibration blinks
+// happen before SD is touched, so those are unaffected.
+const int STATUS_LED_PIN = LED_BUILTIN;
+
+void statusBlink(int count, int onMs, int offMs, int gapMs = 600) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    delay(onMs);
+    digitalWrite(STATUS_LED_PIN, LOW);
+    delay(offMs);
+  }
+  delay(gapMs);
+}
+
+unsigned long lastHeartbeat = 0;
+const unsigned long HEARTBEAT_INTERVAL_MS = 2000;
+const unsigned long HEARTBEAT_ON_MS = 60;
+void heartbeatTick() {
+  unsigned long hbNow = millis();
+  unsigned long since = hbNow - lastHeartbeat;
+  if (since < HEARTBEAT_ON_MS) {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+  } else if (since < HEARTBEAT_INTERVAL_MS) {
+    digitalWrite(STATUS_LED_PIN, LOW);
+  } else {
+    lastHeartbeat = hbNow;
+  }
+}
+
+const int SD_CS_PIN = 10;
+File logFile;
+bool sdReady = false;
+char logFileName[16];
+unsigned long logWriteCount = 0;
+const int FLUSH_EVERY_N_WRITES = 10;
+
+char cmdBuf[8];
+
+const int PITCH_MIN = 35, PITCH_MAX = 106;
+const int ROLL_MIN  = 40, ROLL_MAX  = 130;
+const int PITCH_CENTER = 85;
+const int ROLL_CENTER  = 65;
+
+const int AUX_START_ANGLE = 100;
+const int AUX_END_ANGLE   = 10;
+bool auxTriggered = false;
+bool launchDetected = false;
+
+float groundAltitude = 0;
+const float LAUNCH_ALT_THRESHOLD = 5.0;
+const int LAUNCH_CONFIRM_COUNT = 3;
+int launchConfirmCounter = 0;
+unsigned long launchTime = 0;
+
+float peakAltitude = -1000;
+const float APOGEE_DROP_THRESHOLD = 1.0;
+const int APOGEE_CONFIRM_COUNT = 3;
+const unsigned long MIN_APOGEE_CHECK_DELAY_MS = 3000;
+int apogeeConfirmCounter = 0;
+bool apogeeDetected = false;
+
+// ---- Failsafe deployment ----
+// Forces the aux/chute servo to deploy this long after launch, no matter
+// what the barometric apogee logic is doing. Must be set safely AFTER your
+// motor's burn + coast-to-apogee time, or you'll deploy under thrust.
+const unsigned long FAILSAFE_DEPLOY_MS = 7000;
+
+float Kp = 1.75;
+float Ki = 1;
+float Kd = 0.2;
+
+int PITCH_DIR = -1;
+int ROLL_DIR  = 1;
+
+float PITCH_REFERENCE = 90.0;
+float ROLL_REFERENCE  = 90.0;
+
+float pitchIntegral = 0, rollIntegral = 0;
+float lastPitchError = 0, lastRollError = 0;
+unsigned long lastTime = 0;
+
+const float INTEGRAL_LIMIT = 20.0;
+const float DEADBAND = 1.0;
+
+unsigned long lastGoodRead = 0;
+const unsigned long I2C_TIMEOUT_MS = 500;
+
+void calibrateReference() {
+  Serial.println(F("Calibrating... hold board upright, steady."));
+  delay(1000);
+
+  float pitchSum = 0, rollSum = 0;
+  const int samples = 20;
+  for (int i = 0; i < samples; i++) {
+    sensors_event_t event;
+    bno.getEvent(&event);
+    pitchSum += event.orientation.z;
+    rollSum  += event.orientation.y;
+    delay(20);
+  }
+  PITCH_REFERENCE = pitchSum / samples;
+  ROLL_REFERENCE  = rollSum / samples;
+
+  pitchIntegral = 0;
+  rollIntegral = 0;
+  lastPitchError = 0;
+  lastRollError = 0;
+
+  Serial.print(F("Calibrated — Pitch ref: ")); Serial.print(PITCH_REFERENCE);
+  Serial.print(F("  Roll ref: ")); Serial.println(ROLL_REFERENCE);
+}
+
+void calibrateGroundAltitude() {
+  Serial.println(F("Reading ground altitude (BMP280)..."));
+  float sum = 0;
+  const int samples = 20;
+  for (int i = 0; i < samples; i++) {
+    sum += bmp.readAltitude(1013.25);
+    delay(20);
+  }
+  groundAltitude = sum / samples;
+  Serial.print(F("Ground altitude set to: ")); Serial.print(groundAltitude); Serial.println(F(" m"));
+}
+
+void loadStoredOffsets() {
+  adafruit_bno055_offsets_t offsets;
+  offsets.accel_offset_x = STORED_OFFSETS[0];
+  offsets.accel_offset_y = STORED_OFFSETS[1];
+  offsets.accel_offset_z = STORED_OFFSETS[2];
+  offsets.mag_offset_x   = STORED_OFFSETS[3];
+  offsets.mag_offset_y   = STORED_OFFSETS[4];
+  offsets.mag_offset_z   = STORED_OFFSETS[5];
+  offsets.gyro_offset_x  = STORED_OFFSETS[6];
+  offsets.gyro_offset_y  = STORED_OFFSETS[7];
+  offsets.gyro_offset_z  = STORED_OFFSETS[8];
+  offsets.accel_radius   = STORED_OFFSETS[9];
+  offsets.mag_radius     = STORED_OFFSETS[10];
+
+  bno.setSensorOffsets(offsets);
+  delay(200);
+}
+
+void chooseLogFileName() {
+  for (int i = 0; i < 100; i++) {
+    char candidate[16];
+    snprintf(candidate, sizeof(candidate), "FLIGHT%02d.CSV", i);
+    if (!SD.exists(candidate)) {
+      strncpy(logFileName, candidate, sizeof(logFileName));
+      return;
+    }
+  }
+  strncpy(logFileName, "FLIGHT99.CSV", sizeof(logFileName));
+}
+
+void initSD() {
+  Serial.print(F("Initializing SD card... "));
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println(F("FAILED."));
+    sdReady = false;
+    statusBlink(4, 100, 100, 800); // non-fatal warning — flight continues without logging
+    return;
+  }
+  Serial.println(F("OK."));
+
+  chooseLogFileName();
+  logFile = SD.open(logFileName, FILE_WRITE);
+  if (!logFile) {
+    Serial.print(F("Could not open ")); Serial.println(logFileName);
+    sdReady = false;
+    statusBlink(4, 100, 100, 800);
+    return;
+  }
+
+  logFile.println(F("time_ms,phase,altitude_m,temp_C,pressure_hPa,"
+                     "pitch_deg,roll_deg,pitch_error,roll_error,"
+                     "pitch_integral,roll_integral,pitch_cmd,roll_cmd,"
+                     "calib_sys,calib_gyro,calib_accel,calib_mag"));
+  logFile.flush();
+
+  sdReady = true;
+  Serial.print(F("Logging to ")); Serial.println(logFileName);
+}
+
+void writeLogRow(float altitude, float temp, float pressure,
+                  float pitch, float roll, float pitchError, float rollError,
+                  int pitchCmd, int rollCmd) {
+  if (!sdReady || !logFile) return;
+
+  const char* phase;
+  if (apogeeDetected)       phase = "DESCENT";
+  else if (launchDetected)  phase = "FLIGHT";
+  else                      phase = "GROUND";
+
+  uint8_t sysCal, gyroCal, accelCal, magCal;
+  bno.getCalibration(&sysCal, &gyroCal, &accelCal, &magCal);
+
+  logFile.print(millis());          logFile.print(',');
+  logFile.print(phase);             logFile.print(',');
+  logFile.print(altitude, 2);       logFile.print(',');
+  logFile.print(temp, 2);           logFile.print(',');
+  logFile.print(pressure, 2);       logFile.print(',');
+  logFile.print(pitch, 2);          logFile.print(',');
+  logFile.print(roll, 2);           logFile.print(',');
+  logFile.print(pitchError, 2);     logFile.print(',');
+  logFile.print(rollError, 2);      logFile.print(',');
+  logFile.print(pitchIntegral, 3);  logFile.print(',');
+  logFile.print(rollIntegral, 3);   logFile.print(',');
+  logFile.print(pitchCmd);          logFile.print(',');
+  logFile.print(rollCmd);           logFile.print(',');
+  logFile.print(sysCal);            logFile.print(',');
+  logFile.print(gyroCal);           logFile.print(',');
+  logFile.print(accelCal);          logFile.print(',');
+  logFile.println(magCal);
+
+  logWriteCount++;
+  if (logWriteCount % FLUSH_EVERY_N_WRITES == 0) {
+    logFile.flush();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println(F("TVC PID Stabilization Test"));
+
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);
+
+  Wire.begin();
+  Wire.setWireTimeout(15000, true);
+
+  servoPitch.attach(SERVO_PITCH_PIN);
+  servoRoll.attach(SERVO_ROLL_PIN);
+  servoAux.attach(SERVO_AUX_PIN);
+
+  servoPitch.write(PITCH_CENTER);
+  servoRoll.write(ROLL_CENTER);
+  servoAux.write(AUX_START_ANGLE);
+
+  if (!bno.begin()) {
+    Serial.println(F("BNO055 not detected. Check wiring/address."));
+    while (1) statusBlink(1, 150, 150, 400); // fast single blink = BNO fault
+  }
+  delay(1000);
+
+#if USE_STORED_OFFSETS
+  loadStoredOffsets();
+#endif
+
+  bno.setExtCrystalUse(true);
+
+  if (!bmp.begin(0x77)) {
+    Serial.println(F("BMP280 not detected. Check wiring/address."));
+    while (1) statusBlink(2, 150, 150, 600); // fast double blink = BMP fault
+  }
+
+  lastGoodRead = millis();
+  lastTime = millis();
+
+  Serial.println(F("Type 'zero' to recalibrate upright reference. Type 'ground' to recalibrate ground altitude."));
+  calibrateReference();
+  calibrateGroundAltitude();
+  initSD();
+
+  // Count out calib_sys 3 times so it's readable without a screen.
+  // 3 blinks each round = fully calibrated and ready.
+  uint8_t sysCal, gyroCal, accelCal, magCal;
+  bno.getCalibration(&sysCal, &gyroCal, &accelCal, &magCal);
+  for (int i = 0; i < 3; i++) {
+    statusBlink(sysCal, 200, 200, 1000);
+  }
+
+  // Ready signal — one long steady LED-on right before the flight loop starts.
+  digitalWrite(STATUS_LED_PIN, HIGH);
+  delay(800);
+  digitalWrite(STATUS_LED_PIN, LOW);
+
+  launchDetected = false;
+  auxTriggered = false;
+  apogeeDetected = false;
+}
+
+void loop() {
+  heartbeatTick();
+
+  if (Serial.available()) {
+    int len = Serial.readBytesUntil('\n', cmdBuf, sizeof(cmdBuf) - 1);
+    cmdBuf[len] = '\0';
+    if (strcasecmp(cmdBuf, "zero") == 0) {
+      calibrateReference();
+      return;
+    }
+    if (strcasecmp(cmdBuf, "ground") == 0) {
+      calibrateGroundAltitude();
+      return;
+    }
+  }
+
+  float currentAlt  = bmp.readAltitude(1013.25);
+  float currentTemp = bmp.readTemperature();
+  float currentPressure = bmp.readPressure() / 100.0F;
+
+  if (!launchDetected) {
+    float altGain = currentAlt - groundAltitude;
+    if (altGain > LAUNCH_ALT_THRESHOLD) {
+      launchConfirmCounter++;
+    } else {
+      launchConfirmCounter = 0;
+    }
+    if (launchConfirmCounter >= LAUNCH_CONFIRM_COUNT) {
+      launchDetected = true;
+      launchTime = millis();
+      peakAltitude = currentAlt;
+      Serial.println(F("LAUNCH DETECTED (altitude threshold exceeded)"));
+    }
+  }
+
+  // ---- Apogee detection & Aux servo deployment (D8): 100 -> 10 ----
+  if (launchDetected && !auxTriggered && (millis() - launchTime >= MIN_APOGEE_CHECK_DELAY_MS)) {
+    if (currentAlt > peakAltitude) {
+      peakAltitude = currentAlt;
+      apogeeConfirmCounter = 0;
+    } else if (peakAltitude - currentAlt > APOGEE_DROP_THRESHOLD) {
+      apogeeConfirmCounter++;
+    }
+
+    if (apogeeConfirmCounter >= APOGEE_CONFIRM_COUNT) {
+      servoAux.write(AUX_END_ANGLE);
+      auxTriggered = true;
+      apogeeDetected = true;
+      Serial.print(F("APOGEE DETECTED at "));
+      Serial.print(peakAltitude);
+      Serial.println(F(" m — Aux servo (D8) deployed: 100 -> 10"));
+    }
+  }
+
+  // ---- Failsafe: force deployment if apogee logic hasn't fired by T+7s ----
+  if (launchDetected && !auxTriggered && (millis() - launchTime >= FAILSAFE_DEPLOY_MS)) {
+    servoAux.write(AUX_END_ANGLE);
+    auxTriggered = true;
+    apogeeDetected = true;
+    Serial.println(F("FAILSAFE DEPLOY (timer) — apogee logic did not trigger in time"));
+  }
+
+  sensors_event_t event;
+  bno.getEvent(&event);
+
+  if (Wire.getWireTimeoutFlag()) {
+    Wire.clearWireTimeoutFlag();
+    Serial.println(F("I2C timeout detected — bus recovered, skipping this cycle."));
+    return;
+  }
+
+  float roll  = event.orientation.y;
+  float pitch = event.orientation.z;
+
+  if (roll == 0.0 && pitch == 0.0) {
+    if (millis() - lastGoodRead > I2C_TIMEOUT_MS) {
+      Serial.println(F("Sensor data stale — possible I2C fault."));
+    }
+  } else {
+    lastGoodRead = millis();
+  }
+
+  float pitchErrorRaw = pitch - PITCH_REFERENCE;
+  float rollErrorRaw  = roll  - ROLL_REFERENCE;
+
+  if (abs(pitchErrorRaw) < DEADBAND) pitchErrorRaw = 0;
+  if (abs(rollErrorRaw)  < DEADBAND) rollErrorRaw  = 0;
+
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  if (dt <= 0) dt = 0.001;
+  lastTime = now;
+
+  float pitchError = -pitchErrorRaw;
+  pitchIntegral += pitchError * dt;
+  pitchIntegral = constrain(pitchIntegral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+  float pitchDerivative = (pitchError - lastPitchError) / dt;
+  lastPitchError = pitchError;
+
+  float pitchOutput = (Kp * pitchError) + (Ki * pitchIntegral) + (Kd * pitchDerivative);
+  int pitchCmd = PITCH_CENTER + (int)(pitchOutput * PITCH_DIR);
+
+  float rollError = -rollErrorRaw;
+  rollIntegral += rollError * dt;
+  rollIntegral = constrain(rollIntegral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+  float rollDerivative = (rollError - lastRollError) / dt;
+  lastRollError = rollError;
+
+  float rollOutput = (Kp * rollError) + (Ki * rollIntegral) + (Kd * rollDerivative);
+  int rollCmd = ROLL_CENTER + (int)(rollOutput * ROLL_DIR);
+
+  pitchCmd = constrain(pitchCmd, PITCH_MIN, PITCH_MAX);
+  rollCmd  = constrain(rollCmd, ROLL_MIN, ROLL_MAX);
+
+  servoPitch.write(pitchCmd);
+  servoRoll.write(rollCmd);
+
+  writeLogRow(currentAlt, currentTemp, currentPressure,
+              pitch, roll, pitchError, rollError, pitchCmd, rollCmd);
+
+#if DEBUG_SERIAL
+  Serial.print(F("Pitch: ")); Serial.print(pitch);
+  Serial.print(F("  Roll: ")); Serial.print(roll);
+  Serial.print(F("  -> ServoPitch: ")); Serial.print(pitchCmd);
+  Serial.print(F("  ServoRoll: ")); Serial.println(rollCmd);
+#endif
+
+  delay(20);
+}
