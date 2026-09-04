@@ -1,0 +1,51 @@
+import processing.serial.*;
+
+Serial myPort;
+float heading, roll, pitch;
+
+void setup() {
+  size(700, 500, P3D);
+  myPort = new Serial(this, "COM3", 115200);
+  myPort.bufferUntil('\n');
+}
+
+void draw() {
+  background(30);
+  lights();
+  
+  fill(255);
+  textSize(16);
+  text("Heading: " + nf(heading, 1, 1) + "°", 20, 30);
+  text("Roll: "    + nf(roll, 1, 1)    + "°", 20, 55);
+  text("Pitch: "   + nf(pitch, 1, 1)   + "°", 20, 80);
+  
+  translate(width/2, height/2, 0);
+  rotateX(radians(-pitch));
+  rotateY(radians(heading));
+  rotateZ(radians(roll));
+  
+  fill(0, 120, 255);
+  box(200, 20, 120);
+  
+  translate(100, 0, 0);
+  fill(255, 0, 0);
+  sphere(12);
+}
+
+void serialEvent(Serial p) {
+  String line = p.readStringUntil('\n');
+  if (line != null) {
+    line = trim(line);
+    if (line.startsWith("Heading:")) {
+      String[] tokens = split(line, ',');
+      for (String t : tokens) {
+        String[] kv = split(trim(t), ':');
+        if (kv.length == 2) {
+          if (kv[0].equals("Heading")) heading = float(kv[1]);
+          if (kv[0].equals("Roll"))    roll    = float(kv[1]);
+          if (kv[0].equals("Pitch"))   pitch   = float(kv[1]);
+        }
+      }
+    }
+  }
+}
