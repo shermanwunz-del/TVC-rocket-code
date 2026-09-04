@@ -1,0 +1,97 @@
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+
+Adafruit_BMP280 bmp;
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x29);
+
+float groundLevelPressure; // hPa, our "zero" reference
+
+// Complementary filter state
+float fusedAltitude = 0.0;   // m
+float fusedVelocity = 0.0;   // m/s (vertical)
+
+unsigned long lastUpdate = 0;
+
+// Tuning: how much we trust baro vs accel over time.
+// Larger tau = trust accel more (smoother but drifts);
+// smaller tau = trust baro more (noisier but no drift).
+const float TAU = 2.0; // seconds
+
+void setup() {
+  Serial.begin(115200);
+
+  if (!bmp.begin(0x77)) {
+    Serial.println("BMP280 not found! Check wiring.");
+    while (1);
+  }
+
+  if (!bno.begin()) {
+    Serial.println("BNO055 not found! Check wiring.");
+    while (1);
+  }
+  bno.setExtCrystalUse(true);
+
+  Serial.println("Calibrating ground level pressure...");
+  float sum = 0;
+  const int samples = 50;
+  for (int i = 0; i < samples; i++) {
+    sum += bmp.readPressure() / 100.0; // Pa -> hPa
+    delay(20);
+  }
+  groundLevelPressure = sum / samples;
+
+  Serial.print("Ground level pressure set to: ");
+  Serial.print(groundLevelPressure);
+  Serial.println(" hPa");
+
+  lastUpdate = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  float dt = (now - lastUpdate) / 1000.0;
+  if (dt <= 0) return;
+  lastUpdate = now;
+
+  // --- Baro altitude (absolute, drift-free, but noisy/laggy) ---
+  float baroAltitude = bmp.readAltitude(groundLevelPressure);
+
+  // --- Vertical acceleration from BNO055 ---
+  // getVector(VECTOR_LINEARACCEL) returns gravity-compensated
+  // acceleration in the SENSOR frame. We need it in the WORLD frame
+  // (specifically the vertical/world-Z component), so rotate it
+  // using the current orientation quaternion.
+  imu::Quaternion q = bno.getQuat();
+  imu::Vector<3> linAccel = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+
+  imu::Vector<3> accelVec(linAccel.x(), linAccel.y(), linAccel.z());
+  imu::Vector<3> worldAccel = q.rotateVector(accelVec);
+
+  float verticalAccel = worldAccel.z(); // m/s^2, world-frame vertical accel
+
+  // --- Complementary filter fusion ---
+  // Predict using accel (integrate twice), then pull toward baro
+  // with a time constant TAU so slow drift gets corrected but
+  // fast dynamics come from the accelerometer.
+  float alpha = TAU / (TAU + dt);
+
+  // Integrate accel into velocity and predicted altitude
+  fusedVelocity += verticalAccel * dt;
+  float predictedAltitude = fusedAltitude + fusedVelocity * dt;
+
+  // Blend prediction with baro measurement
+  fusedAltitude = alpha * predictedAltitude + (1 - alpha) * baroAltitude;
+
+  // Correct velocity too, so it doesn't run away from reality
+  float altitudeError = baroAltitude - predictedAltitude;
+  fusedVelocity += (1 - alpha) * (altitudeError / dt) * 0.1; // small correction gain
+
+  // --- Output ---
+  Serial.print("Baro Alt: ");   Serial.print(baroAltitude, 2);   Serial.print(" m\t");
+  Serial.print("Fused Alt: ");  Serial.print(fusedAltitude, 2);  Serial.print(" m\t");
+  Serial.print("Vel: ");        Serial.print(fusedVelocity, 2);  Serial.println(" m/s");
+
+  delay(20); // ~50 Hz loop
+}
